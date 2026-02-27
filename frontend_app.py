@@ -1,4 +1,3 @@
-import json
 import os
 from io import BytesIO
 from typing import Any, Dict, List, Optional
@@ -188,15 +187,20 @@ def _candidate_base_urls(base_url: str) -> List[str]:
     return candidates
 
 
-def _api_health_check(base_url: str) -> bool:
+def _api_health_info(base_url: str) -> Optional[Dict[str, Any]]:
     for candidate in _candidate_base_urls(base_url):
         try:
             resp = requests.get(f"{candidate}/health", timeout=8)
             if resp.status_code == 200:
-                return True
+                payload = resp.json() if resp.content else {}
+                return {
+                    "ok": True,
+                    "status": payload.get("status", "ok"),
+                    "policies_loaded": int(payload.get("policies_loaded", 0) or 0),
+                }
         except requests.RequestException:
             continue
-    return False
+    return None
 
 
 def upload_policy(base_url: str, uploaded_file, policy_name: str) -> Optional[Dict[str, Any]]:
@@ -284,34 +288,6 @@ def compare_question(base_url: str, question: str, policy_ids: List[str], explai
     }
 
 
-def get_evaluation(base_url: str) -> Optional[Dict[str, Any]]:
-    for candidate in _candidate_base_urls(base_url):
-        try:
-            resp = requests.get(f"{candidate}/evaluation", timeout=20)
-            if resp.ok:
-                return resp.json()
-        except requests.RequestException:
-            continue
-    return None
-
-
-def submit_feedback(base_url: str, query_id: str, is_correct: bool) -> bool:
-    if not query_id:
-        return False
-    for candidate in _candidate_base_urls(base_url):
-        try:
-            resp = requests.post(
-                f"{candidate}/feedback",
-                json={"query_id": query_id, "is_correct": is_correct},
-                timeout=15,
-            )
-            if resp.ok:
-                return True
-        except requests.RequestException:
-            continue
-    return False
-
-
 def predict_claim(
     base_url: str,
     policy_id: str,
@@ -319,9 +295,9 @@ def predict_claim(
     claim_amount: float,
     waiting_period_completed_months: int,
     has_pre_existing_condition: bool,
-) -> Optional[Dict[str, Any]]:
+) -> Dict[str, Any]:
     if not policy_id:
-        return None
+        return {"ok": False, "error": "No policy selected"}
     payload = {
         "policy_id": policy_id,
         "procedure": procedure,
@@ -329,14 +305,24 @@ def predict_claim(
         "waiting_period_completed_months": waiting_period_completed_months,
         "has_pre_existing_condition": has_pre_existing_condition,
     }
+    last_error = None
     for candidate in _candidate_base_urls(base_url):
         try:
             resp = requests.post(f"{candidate}/claim_prediction", json=payload, timeout=30)
             if resp.ok:
-                return resp.json()
+                body = resp.json() if resp.content else {}
+                body["ok"] = True
+                return body
+            detail = ""
+            try:
+                detail = (resp.json() or {}).get("detail") or ""
+            except Exception:
+                detail = ""
+            last_error = detail or f"HTTP {resp.status_code}: {resp.text[:200]}"
         except requests.RequestException:
+            last_error = "Backend unreachable"
             continue
-    return None
+    return {"ok": False, "error": last_error or "Could not run claim prediction"}
 
 
 def demo_answer(question: str) -> Dict[str, Any]:
@@ -431,22 +417,6 @@ def main() -> None:
     st.title("Health Insurance Policy Simplifier")
     st.caption("Upload policy PDFs and ask coverage questions with grounded citations.")
 
-    with st.sidebar:
-        st.subheader("Configuration")
-        default_url = os.getenv("API_BASE_URL", "http://localhost:8000")
-        base_url = st.text_input("Backend URL", value=default_url).rstrip("/")
-        demo_mode = st.toggle("Demo mode (no backend required)", value=False)
-
-        if not demo_mode:
-            healthy = _api_health_check(base_url)
-            if healthy:
-                st.success("Backend reachable")
-            else:
-                st.warning("Backend not reachable. You can still use demo mode.")
-
-        st.markdown("---")
-        st.caption("Safety: This is a decision-support assistant, not legal or claim approval advice.")
-
     if "current_policy_id" not in st.session_state:
         st.session_state.current_policy_id = None
     if "history" not in st.session_state:
@@ -457,6 +427,27 @@ def main() -> None:
         st.session_state.question_input = ""
     if "pending_question_input" not in st.session_state:
         st.session_state.pending_question_input = None
+
+    with st.sidebar:
+        st.subheader("Configuration")
+        default_url = os.getenv("API_BASE_URL", "http://localhost:8000")
+        base_url = st.text_input("Backend URL", value=default_url).rstrip("/")
+        demo_mode = st.toggle("Demo mode (no backend required)", value=False)
+
+        if not demo_mode:
+            health_info = _api_health_info(base_url)
+            if health_info and health_info.get("ok"):
+                st.success("Backend reachable")
+                backend_policies = int(health_info.get("policies_loaded", 0) or 0)
+                if backend_policies == 0 and st.session_state.get("policies"):
+                    st.session_state.policies = {}
+                    st.session_state.current_policy_id = None
+                    st.warning("Backend was restarted and has no policies loaded. Please upload policy again.")
+            else:
+                st.warning("Backend not reachable. You can still use demo mode.")
+
+        st.markdown("---")
+        st.caption("Safety: This is a decision-support assistant, not legal or claim approval advice.")
 
     if st.session_state.pending_question_input is not None:
         st.session_state.question_input = st.session_state.pending_question_input
@@ -624,38 +615,6 @@ def main() -> None:
                         st.write(citation["text"])
 
     st.markdown("---")
-    st.subheader("Evaluation Sheet")
-    if demo_mode:
-        st.info("Evaluation metrics are available in live API mode.")
-    else:
-        eval_data = get_evaluation(base_url)
-        if not eval_data:
-            st.warning("Could not fetch evaluation metrics from backend.")
-        else:
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("Total Queries", eval_data.get("total_queries", 0))
-            with m2:
-                acc = eval_data.get("accuracy")
-                st.metric("Accuracy", f"{acc:.1%}" if isinstance(acc, (int, float)) else "N/A")
-            with m3:
-                cp = eval_data.get("citation_precision")
-                st.metric("Citation Precision", f"{cp:.1%}" if isinstance(cp, (int, float)) else "N/A")
-            with m4:
-                fr = eval_data.get("fallback_rate", 0.0)
-                st.metric("Fallback Rate", f"{fr:.1%}")
-
-            if eval_data.get("reviewed_queries", 0) == 0:
-                st.info("Accuracy is currently unavailable because no reviewed labels exist.")
-
-            with st.expander("Recent Evaluation Rows"):
-                rows = eval_data.get("recent_queries", [])
-                if rows:
-                    st.dataframe(rows, use_container_width=True)
-                else:
-                    st.caption("No evaluation records yet")
-
-    st.markdown("---")
     st.subheader("Claim Prediction (Simple)")
     if demo_mode:
         st.info("Claim prediction runs in live API mode.")
@@ -689,10 +648,17 @@ def main() -> None:
                     waiting_period_completed_months=int(waiting_months),
                     has_pre_existing_condition=bool(has_ped),
                 )
-                if not prediction:
-                    st.warning("Could not run claim prediction. Check backend status.")
+                if not prediction.get("ok"):
+                    error_message = str(prediction.get("error", "Could not run claim prediction."))
+                    if "policy_id not found" in error_message.lower():
+                        st.session_state.policies.pop(claim_policy_id, None)
+                        if st.session_state.current_policy_id == claim_policy_id:
+                            st.session_state.current_policy_id = None
+                        st.error("Selected policy is no longer loaded in backend. Please upload it again.")
+                    else:
+                        st.error(f"Claim prediction failed: {error_message}")
                 else:
-                    st.metric("Approval Probability", f"{float(prediction.get('approval_probability', 0.0)):.1%}")
+                    st.metric("Approval Probability", f"{float(prediction.get('approval_probability', 0.0)):.2%}")
                     st.write("Risk Band:", prediction.get("risk_band", "-"))
                     factors = prediction.get("factors", [])
                     if factors:

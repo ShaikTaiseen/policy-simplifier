@@ -1,6 +1,8 @@
 import json
 import os
 import re
+import sqlite3
+import threading
 import uuid
 from collections import Counter
 from datetime import datetime
@@ -30,12 +32,6 @@ except ImportError:
     ChatOpenAI = None
     OpenAIEmbeddings = None
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
-
 app = FastAPI(title="Health Insurance Policy Simplifier API", version="1.0.0")
 POLICY_NOTICE = "This assistant supports policy interpretation only and does not provide legal advice."
 QUESTION_TYPES = {"FACTUAL", "ANALYTICAL", "COVERAGE / DECISION"}
@@ -62,11 +58,6 @@ class CompareRequest(BaseModel):
     explain_language: str = "English"
 
 
-class FeedbackRequest(BaseModel):
-    query_id: str
-    is_correct: bool
-
-
 class ClaimPredictionRequest(BaseModel):
     policy_id: str
     procedure: str
@@ -81,6 +72,8 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+DB_PATH = os.getenv("APP_DB_PATH", "insurance_app.db")
+DB_LOCK = threading.Lock()
 
 KG_TERM_GROUPS = {
     "benefit": [
@@ -120,13 +113,196 @@ KG_TERM_GROUPS = {
 }
 
 
-def _get_openai_client():
-    if OpenAI is None:
-        return None
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None
-    return OpenAI(api_key=api_key)
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db() -> None:
+    with DB_LOCK:
+        with _db_connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS policies (
+                    policy_id TEXT PRIMARY KEY,
+                    policy_name TEXT NOT NULL,
+                    filename TEXT,
+                    parser_used TEXT,
+                    embedding_mode TEXT,
+                    chunks_json TEXT NOT NULL,
+                    knowledge_graph_json TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS query_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS claim_predictions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+
+def _serialize_chunks(chunks: List[Chunk]) -> str:
+    payload = [
+        {
+            "page_no": chunk.page_no,
+            "section": chunk.section,
+            "text": chunk.text,
+        }
+        for chunk in chunks
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _deserialize_chunks(chunks_json: str) -> List[Chunk]:
+    parsed = json.loads(chunks_json or "[]")
+    chunks: List[Chunk] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        chunks.append(
+            Chunk(
+                page_no=int(item.get("page_no", 1) or 1),
+                section=str(item.get("section", "Policy Clause")),
+                text=str(item.get("text", "")),
+            )
+        )
+    return chunks
+
+
+def _save_policy_to_db(policy_id: str, policy: Dict) -> None:
+    now = datetime.utcnow().isoformat() + "Z"
+    chunks_json = _serialize_chunks(policy.get("chunks", []))
+    knowledge_graph_json = json.dumps(policy.get("knowledge_graph", {}), ensure_ascii=False)
+
+    with DB_LOCK:
+        with _db_connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO policies (
+                    policy_id, policy_name, filename, parser_used, embedding_mode, chunks_json, knowledge_graph_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    policy_id,
+                    policy.get("policy_name", policy_id),
+                    policy.get("filename", ""),
+                    policy.get("parser_used", "unknown"),
+                    policy.get("embedding_mode", "unknown"),
+                    chunks_json,
+                    knowledge_graph_json,
+                    now,
+                ),
+            )
+            conn.commit()
+
+
+def _load_policies_from_db() -> List[Dict]:
+    with DB_LOCK:
+        with _db_connect() as conn:
+            rows = conn.execute(
+                "SELECT policy_id, policy_name, filename, parser_used, embedding_mode, chunks_json, knowledge_graph_json FROM policies"
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _save_query_event_to_db(event: Dict) -> None:
+    now = datetime.utcnow().isoformat() + "Z"
+    with DB_LOCK:
+        with _db_connect() as conn:
+            conn.execute(
+                "INSERT INTO query_events (event_json, created_at) VALUES (?, ?)",
+                (json.dumps(event, ensure_ascii=False), now),
+            )
+            conn.commit()
+
+
+def _load_query_log_from_db(limit: int = 500) -> List[Dict]:
+    with DB_LOCK:
+        with _db_connect() as conn:
+            rows = conn.execute(
+                "SELECT event_json FROM query_events ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    result: List[Dict] = []
+    for row in reversed(rows):
+        try:
+            result.append(json.loads(row["event_json"]))
+        except Exception:
+            continue
+    return result
+
+
+def _save_claim_prediction_to_db(event: Dict) -> None:
+    now = datetime.utcnow().isoformat() + "Z"
+    with DB_LOCK:
+        with _db_connect() as conn:
+            conn.execute(
+                "INSERT INTO claim_predictions (event_json, created_at) VALUES (?, ?)",
+                (json.dumps(event, ensure_ascii=False), now),
+            )
+            conn.commit()
+
+
+@app.on_event("startup")
+def _bootstrap_from_db() -> None:
+    _init_db()
+
+    embeddings_model, runtime_embedding_mode = _get_langchain_embeddings()
+    stored_policies = _load_policies_from_db()
+    for row in stored_policies:
+        policy_id = row.get("policy_id")
+        policy_name = row.get("policy_name") or policy_id
+        chunks = _deserialize_chunks(row.get("chunks_json", "[]"))
+        documents = _build_documents(policy_name, chunks)
+
+        vectorstore = None
+        if embeddings_model is not None and FAISS is not None and documents:
+            try:
+                vectorstore = FAISS.from_documents(documents, embeddings_model)
+            except Exception:
+                vectorstore = None
+
+        kg = None
+        raw_kg = row.get("knowledge_graph_json")
+        if raw_kg:
+            try:
+                kg = json.loads(raw_kg)
+            except Exception:
+                kg = None
+        if not isinstance(kg, dict):
+            kg = _build_policy_knowledge_graph(policy_id, policy_name, chunks)
+
+        POLICIES[policy_id] = {
+            "policy_id": policy_id,
+            "policy_name": policy_name,
+            "chunks": chunks,
+            "documents": documents,
+            "vectorstore": vectorstore,
+            "filename": row.get("filename", ""),
+            "embedding_mode": row.get("embedding_mode") or runtime_embedding_mode,
+            "parser_used": row.get("parser_used") or "unknown",
+            "knowledge_graph": kg,
+        }
+
+    QUERY_LOG.clear()
+    QUERY_LOG.extend(_load_query_log_from_db(limit=500))
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -154,11 +330,6 @@ def _split_into_chunks(page_text: str, page_no: int, chunk_size: int = 700, over
 
 def _tokenize(text: str) -> List[str]:
     return [token for token in re.findall(r"[a-zA-Z0-9]+", text.lower()) if len(token) > 2]
-
-
-def _embed_texts(client, texts: List[str]) -> List[List[float]]:
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-    return [item.embedding for item in response.data]
 
 
 def _score_chunk(question_tokens: List[str], chunk_text: str) -> float:
@@ -292,6 +463,8 @@ def _predict_claim_approval(
     score = 0.5
     factors: List[str] = []
 
+    safe_amount = float(max(0.0, claim_amount))
+
     verdict_upper = verdict.upper()
     if verdict_upper == "SUPPORTED":
         score += 0.25
@@ -319,12 +492,31 @@ def _predict_claim_approval(
         score -= 0.08
         factors.append("Pre-existing condition may trigger exclusions")
 
-    if claim_amount > 500000:
-        score -= 0.06
-        factors.append("High claim amount may require stricter review")
-    elif claim_amount <= 100000:
-        score += 0.03
-        factors.append("Moderate claim amount improves approval likelihood")
+    if safe_amount <= 50000:
+        amount_modifier = 0.20 - (safe_amount / 50000) * 0.12
+        amount_band = "Very low"
+    elif safe_amount <= 200000:
+        amount_modifier = 0.08 - ((safe_amount - 50000) / 150000) * 0.10
+        amount_band = "Low"
+    elif safe_amount <= 500000:
+        amount_modifier = -0.02 - ((safe_amount - 200000) / 300000) * 0.11
+        amount_band = "Moderate"
+    elif safe_amount <= 1000000:
+        amount_modifier = -0.13 - ((safe_amount - 500000) / 500000) * 0.10
+        amount_band = "High"
+    elif safe_amount <= 2000000:
+        amount_modifier = -0.23 - ((safe_amount - 1000000) / 1000000) * 0.08
+        amount_band = "Very high"
+    else:
+        amount_modifier = -0.31 - min(0.09, ((safe_amount - 2000000) / 2000000) * 0.09)
+        amount_band = "Extreme"
+
+    score += amount_modifier
+    if amount_modifier >= 0:
+        factors.append(f"{amount_band} claim amount band improves approval likelihood")
+    else:
+        factors.append(f"{amount_band} claim amount band increases scrutiny and lowers approval likelihood")
+    factors.append(f"Amount impact applied: {amount_modifier:+.2f} score")
 
     probability = float(max(0.05, min(0.95, score)))
 
@@ -641,21 +833,20 @@ def _generate_rag_answer(
 
 
 def _record_query_event(result: Dict, question: str, policy_id: str) -> None:
-    QUERY_LOG.append(
-        {
-            "query_id": result["query_id"],
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "question": question,
-            "policy_id": policy_id,
-            "policy_name": POLICIES.get(policy_id, {}).get("policy_name", policy_id),
-            "verdict": result.get("verdict"),
-            "mode": result.get("mode"),
-            "grounded": bool(result.get("grounded", False)),
-            "citations_count": len(result.get("citations", [])),
-            "has_valid_citations": any((c.get("text") or "").strip() for c in result.get("citations", [])),
-            "is_correct": None,
-        }
-    )
+    event = {
+        "query_id": result["query_id"],
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "question": question,
+        "policy_id": policy_id,
+        "policy_name": POLICIES.get(policy_id, {}).get("policy_name", policy_id),
+        "verdict": result.get("verdict"),
+        "mode": result.get("mode"),
+        "grounded": bool(result.get("grounded", False)),
+        "citations_count": len(result.get("citations", [])),
+        "has_valid_citations": any((c.get("text") or "").strip() for c in result.get("citations", [])),
+    }
+    QUERY_LOG.append(event)
+    _save_query_event_to_db(event)
 
 
 def _answer_with_policy(question: str, policy_id: str, explain_language: str) -> Dict:
@@ -871,6 +1062,7 @@ async def upload_policy(file: UploadFile = File(...), policy_name: str = Form(""
 
     kg = _build_policy_knowledge_graph(policy_id, policy_title, chunks)
     POLICIES[policy_id]["knowledge_graph"] = kg
+    _save_policy_to_db(policy_id, POLICIES[policy_id])
 
     return {
         "policy_id": policy_id,
@@ -962,27 +1154,13 @@ def evaluation_summary():
     grounded_queries = sum(1 for item in QUERY_LOG if item.get("grounded") is True)
     valid_citation_queries = sum(1 for item in QUERY_LOG if item.get("has_valid_citations") is True)
 
-    reviewed = [item for item in QUERY_LOG if item.get("is_correct") is not None]
-    correct = sum(1 for item in reviewed if item.get("is_correct") is True)
-
     return {
         "total_queries": total_queries,
-        "reviewed_queries": len(reviewed),
-        "accuracy": (correct / len(reviewed)) if reviewed else None,
+        "grounded_rate": (grounded_queries / total_queries) if total_queries else 0.0,
         "citation_precision": (valid_citation_queries / grounded_queries) if grounded_queries else None,
         "fallback_rate": (fallback_queries / total_queries) if total_queries else 0.0,
         "recent_queries": QUERY_LOG[-20:],
     }
-
-
-@app.post("/feedback")
-def submit_feedback(payload: FeedbackRequest):
-    for item in reversed(QUERY_LOG):
-        if item.get("query_id") == payload.query_id:
-            item["is_correct"] = payload.is_correct
-            return {"status": "updated", "query_id": payload.query_id, "is_correct": payload.is_correct}
-
-    raise HTTPException(status_code=404, detail="query_id not found")
 
 
 @app.post("/claim_prediction")
@@ -990,6 +1168,8 @@ def claim_prediction(payload: ClaimPredictionRequest):
     procedure = payload.procedure.strip()
     if not procedure:
         raise HTTPException(status_code=400, detail="procedure is required")
+    if payload.claim_amount < 0:
+        raise HTTPException(status_code=400, detail="claim_amount must be non-negative")
 
     question = f"Is {procedure} covered under this policy?"
     answer_result = _answer_with_policy(question, payload.policy_id, "English")
@@ -1002,7 +1182,7 @@ def claim_prediction(payload: ClaimPredictionRequest):
         has_pre_existing_condition=bool(payload.has_pre_existing_condition),
     )
 
-    return {
+    response_payload = {
         "policy_id": payload.policy_id,
         "procedure": procedure,
         "coverage_verdict": answer_result.get("verdict"),
@@ -1012,3 +1192,18 @@ def claim_prediction(payload: ClaimPredictionRequest):
         "factors": predicted["factors"],
         "grounded_citations": answer_result.get("citations", []),
     }
+    _save_claim_prediction_to_db(
+        {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "policy_id": payload.policy_id,
+            "procedure": procedure,
+            "claim_amount": float(payload.claim_amount),
+            "waiting_period_completed_months": int(payload.waiting_period_completed_months),
+            "has_pre_existing_condition": bool(payload.has_pre_existing_condition),
+            "coverage_verdict": answer_result.get("verdict"),
+            "coverage_confidence": answer_result.get("confidence"),
+            "approval_probability": predicted["approval_probability"],
+            "risk_band": predicted["risk_band"],
+        }
+    )
+    return response_payload

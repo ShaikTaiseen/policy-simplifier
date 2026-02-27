@@ -19,6 +19,7 @@ It supports:
   - Optional: `$env:EMBEDDING_PROVIDER="openai"` (default) or `"local"`
   - Optional (OpenAI mode): `$env:EMBEDDING_MODEL="text-embedding-3-small"`
   - Optional (local mode): `$env:LOCAL_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"`
+  - Optional (SQLite path): `$env:APP_DB_PATH="insurance_app.db"`
 3. Start server
    - `uvicorn backend_app:app --reload --host 0.0.0.0 --port 8000`
 
@@ -30,8 +31,7 @@ It supports:
 - `POST /compare` (same question across 2 policies)
 - `GET /knowledge_graph/{policy_id}` (policy entity relationship graph)
 - `POST /claim_prediction` (simple approval probability estimator)
-- `GET /evaluation` (accuracy/citation/fallback dashboard data)
-- `POST /feedback` (mark query as correct/incorrect)
+- `GET /evaluation` (grounded-rate/citation/fallback dashboard data)
 
 ## Contract
 
